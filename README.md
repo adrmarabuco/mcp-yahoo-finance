@@ -16,6 +16,7 @@ Um servidor MCP (Model Context Protocol) completo para acessar dados do Yahoo Fi
 | `yf_get_news` | Notícias recentes relacionadas |
 | `yf_get_holders` | Principais acionistas institucionais |
 | `yf_get_earnings` | Histórico de lucros e calendário de earnings |
+| `yf_get_calendar` | Calendário de earnings e próximas datas |
 | `yf_compare_stocks` | Comparação lado a lado de múltiplas ações |
 
 ## 📦 Instalação
@@ -88,7 +89,9 @@ Qual é a cotação atual da AAPL?
 ```
 
 A ferramenta `yf_get_quote` retornará:
-- Preço atual e variação do dia
+- Preço atual priorizando `postMarketPrice`/`preMarketPrice` quando disponíveis
+- Campos explícitos para `regular_market_price`, `pre_market_price` e `post_market_price`
+- Origem do preço em `current_price_source` para distinguir regular, pre-market e after-hours
 - Volume e volume médio
 - Market cap
 - P/E ratio e outras métricas

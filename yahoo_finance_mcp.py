@@ -13,9 +13,16 @@ Requirements:
 """
 
 import json
+import asyncio
+import copy
+import os
+import time
 from datetime import datetime, timedelta
 from enum import Enum
+from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from typing import Optional, List, Dict, Any
+from threading import Lock
 
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
@@ -31,6 +38,11 @@ mcp = FastMCP("yahoo_finance_mcp")
 DEFAULT_PERIOD = "1mo"
 DEFAULT_INTERVAL = "1d"
 MAX_SYMBOLS = 10
+YAHOO_TIMEOUT = float(os.getenv("YF_TIMEOUT", "10"))
+YAHOO_INFO_CACHE_TTL = int(os.getenv("YF_INFO_CACHE_TTL", "60"))
+YAHOO_BATCH_WORKERS = int(os.getenv("YF_BATCH_WORKERS", "5"))
+_YAHOO_INFO_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_YAHOO_INFO_CACHE_LOCK = Lock()
 
 # ============================================================================
 # Enums
@@ -211,6 +223,46 @@ class ScreenerInput(BaseModel):
         description="Output format"
     )
 
+class SectorKeyInput(BaseModel):
+    """Input model for sector lookups."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+
+    key: str = Field(
+        ...,
+        description="Sector key (e.g., 'technology', 'healthcare', 'financial-services')",
+        min_length=1,
+        max_length=100
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.JSON,
+        description="Output format"
+    )
+
+    @field_validator('key')
+    @classmethod
+    def validate_key(cls, v: str) -> str:
+        return v.strip().lower()
+
+class IndustryKeyInput(BaseModel):
+    """Input model for industry lookups."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+
+    key: str = Field(
+        ...,
+        description="Industry key (e.g., 'software-infrastructure', 'semiconductors')",
+        min_length=1,
+        max_length=100
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.JSON,
+        description="Output format"
+    )
+
+    @field_validator('key')
+    @classmethod
+    def validate_key(cls, v: str) -> str:
+        return v.strip().lower()
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -225,6 +277,71 @@ def _handle_error(e: Exception, context: str = "") -> str:
     if "rate limit" in error_msg.lower():
         return "Error: Rate limit exceeded. Please wait before making more requests."
     return f"Error: {error_msg}. {context}"
+
+def with_timeout(timeout: float = YAHOO_TIMEOUT):
+    """Run blocking Yahoo Finance work in a worker thread with a timeout."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(func, *args, **kwargs),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                return f"Error: Yahoo Finance request timed out after {timeout:.0f}s."
+        return wrapper
+    return decorator
+
+
+def _get_cached_ticker_data(symbol: str) -> Optional[Dict[str, Any]]:
+    cache_key = symbol.upper()
+    with _YAHOO_INFO_CACHE_LOCK:
+        cached = _YAHOO_INFO_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        expires_at, payload = cached
+        if time.time() >= expires_at:
+            _YAHOO_INFO_CACHE.pop(cache_key, None)
+            return None
+        return copy.deepcopy(payload)
+
+
+def _set_cached_ticker_data(symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    cache_key = symbol.upper()
+    stored = copy.deepcopy(payload)
+    with _YAHOO_INFO_CACHE_LOCK:
+        _YAHOO_INFO_CACHE[cache_key] = (time.time() + max(YAHOO_INFO_CACHE_TTL, 1), stored)
+    return copy.deepcopy(payload)
+
+
+def _get_ticker_data(symbol: str, *, use_cache: bool = True) -> Dict[str, Any]:
+    if use_cache:
+        cached = _get_cached_ticker_data(symbol)
+        if cached is not None:
+            return cached
+    ticker = yf.Ticker(symbol)
+    data = _ticker_to_dict(ticker)
+    return _set_cached_ticker_data(symbol, data)
+
+
+def _get_multiple_ticker_data(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _load_symbol(symbol: str) -> Dict[str, Any]:
+        return _get_ticker_data(symbol)
+
+    if not symbols:
+        return {}
+
+    max_workers = max(1, min(YAHOO_BATCH_WORKERS, len(symbols)))
+    results: Dict[str, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_load_symbol, symbol): symbol for symbol in symbols}
+        for future, symbol in future_map.items():
+            try:
+                results[symbol] = future.result()
+            except Exception as exc:
+                results[symbol] = {"symbol": symbol, "error": str(exc)}
+    return results
 
 def _format_number(value: Any, decimals: int = 2) -> str:
     """Format numbers for display."""
@@ -254,17 +371,203 @@ def _safe_get(data: Dict, key: str, default: Any = None) -> Any:
     """Safely get value from dictionary."""
     return data.get(key, default) if data else default
 
+def _first_valid(*values: Any) -> Any:
+    """Return the first non-null/non-NaN value."""
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, float) and value != value:
+            continue
+        return value
+    return None
+
+def _resolve_quote_price(info: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve regular, pre-market, and after-hours pricing into one payload."""
+    previous_close = _first_valid(
+        _safe_get(info, "previousClose"),
+        _safe_get(info, "regularMarketPreviousClose"),
+    )
+    regular_price = _first_valid(
+        _safe_get(info, "currentPrice"),
+        _safe_get(info, "regularMarketPrice"),
+    )
+    pre_market_price = _safe_get(info, "preMarketPrice")
+    post_market_price = _safe_get(info, "postMarketPrice")
+
+    current_price = regular_price
+    current_price_source = "regular_market"
+    current_price_label = "Regular Market"
+    change_value = _first_valid(
+        _safe_get(info, "regularMarketChange"),
+        regular_price - previous_close
+        if regular_price is not None and previous_close not in (None, 0)
+        else None,
+    )
+    change_percent = _first_valid(
+        _safe_get(info, "regularMarketChangePercent"),
+        (change_value / previous_close) * 100
+        if change_value is not None and previous_close not in (None, 0)
+        else None,
+    )
+
+    if post_market_price is not None:
+        current_price = post_market_price
+        current_price_source = "post_market"
+        current_price_label = "After Hours"
+        change_value = _first_valid(
+            _safe_get(info, "postMarketChange"),
+            post_market_price - regular_price if regular_price is not None else None,
+        )
+        change_percent = _first_valid(
+            _safe_get(info, "postMarketChangePercent"),
+            (change_value / regular_price) * 100
+            if change_value is not None and regular_price not in (None, 0)
+            else None,
+        )
+    elif pre_market_price is not None:
+        current_price = pre_market_price
+        current_price_source = "pre_market"
+        current_price_label = "Pre-Market"
+        change_value = _first_valid(
+            _safe_get(info, "preMarketChange"),
+            pre_market_price - previous_close
+            if previous_close is not None
+            else None,
+        )
+        change_percent = _first_valid(
+            _safe_get(info, "preMarketChangePercent"),
+            (change_value / previous_close) * 100
+            if change_value is not None and previous_close not in (None, 0)
+            else None,
+        )
+
+    return {
+        "current_price": current_price,
+        "current_price_source": current_price_source,
+        "current_price_label": current_price_label,
+        "market_state": _safe_get(info, "marketState"),
+        "regular_market_price": regular_price,
+        "pre_market_price": pre_market_price,
+        "post_market_price": post_market_price,
+        "price_change": change_value,
+        "price_change_percent": change_percent,
+        "previous_close": previous_close,
+    }
+
+def _normalize_value(value: Any) -> Any:
+    """Normalize values for JSON/markdown output (dates, NaN, nested structures)."""
+    if value is None:
+        return None
+    if isinstance(value, float) and value != value:
+        return None
+    # Handle pandas-like objects early to avoid ambiguous truthiness in callers.
+    if hasattr(value, "to_dict") and hasattr(value, "empty") and not isinstance(value, dict):
+        try:
+            if value.empty:
+                return [] if hasattr(value, "columns") else {}
+        except Exception:
+            pass
+        if hasattr(value, "reset_index"):
+            try:
+                records = value.reset_index().to_dict(orient="records")
+                return [_normalize_value(r) for r in records]
+            except Exception:
+                pass
+        try:
+            return _normalize_value(value.to_dict())
+        except Exception:
+            pass
+    if isinstance(value, (list, tuple)):
+        return [_normalize_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _normalize_value(v) for k, v in value.items()}
+    if hasattr(value, "to_pydatetime"):
+        try:
+            return value.to_pydatetime().isoformat()
+        except Exception:
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return value
+
+def _calendar_to_dict(calendar: Any) -> Dict[str, Any]:
+    """Convert the Yahoo Finance calendar to a simple dict."""
+    if calendar is None:
+        return {}
+    try:
+        if hasattr(calendar, "empty") and calendar.empty:
+            return {}
+        if hasattr(calendar, "to_dict"):
+            data = calendar.to_dict()
+            if isinstance(data, dict) and len(data) == 1:
+                data = next(iter(data.values()))
+            return _normalize_value(data) if isinstance(data, dict) else {}
+        if isinstance(calendar, dict):
+            return _normalize_value(calendar)
+    except Exception:
+        return {}
+    return {}
+
+def _df_to_records(df: Any) -> List[Dict[str, Any]]:
+    """Convert a DataFrame-like object to list of records, normalized."""
+    if df is None:
+        return []
+    try:
+        if hasattr(df, "empty") and df.empty:
+            return []
+        if hasattr(df, "reset_index") and hasattr(df, "to_dict"):
+            records = df.reset_index().to_dict(orient="records")
+            return [_normalize_value(r) for r in records]
+    except Exception:
+        return []
+    return []
+
+def _format_value_for_table(value: Any) -> str:
+    """Format values for markdown tables."""
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return json.dumps(value, default=str)
+    return str(value)
+
+def _records_to_markdown_table(records: List[Dict[str, Any]], max_rows: int = 8) -> str:
+    """Render a list of dicts as a markdown table."""
+    if not records:
+        return ""
+    keys = list(records[0].keys())[:6]
+    header = "| " + " | ".join(keys) + " |"
+    separator = "|" + "|".join(["---"] * len(keys)) + "|"
+    rows = []
+    for row in records[:max_rows]:
+        rows.append("| " + " | ".join(_format_value_for_table(row.get(k)) for k in keys) + " |")
+    table = "\n".join([header, separator] + rows)
+    if len(records) > max_rows:
+        table += f"\n\n*Showing {max_rows} of {len(records)} rows*"
+    return table
+
 def _ticker_to_dict(ticker: yf.Ticker) -> Dict[str, Any]:
     """Convert ticker info to a clean dictionary."""
     info = ticker.info
+    price_data = _resolve_quote_price(info)
     return {
         "symbol": _safe_get(info, "symbol"),
         "name": _safe_get(info, "longName") or _safe_get(info, "shortName"),
         "currency": _safe_get(info, "currency"),
         "exchange": _safe_get(info, "exchange"),
         "market_cap": _safe_get(info, "marketCap"),
-        "current_price": _safe_get(info, "currentPrice") or _safe_get(info, "regularMarketPrice"),
-        "previous_close": _safe_get(info, "previousClose"),
+        "current_price": price_data["current_price"],
+        "current_price_source": price_data["current_price_source"],
+        "current_price_label": price_data["current_price_label"],
+        "market_state": price_data["market_state"],
+        "regular_market_price": price_data["regular_market_price"],
+        "pre_market_price": price_data["pre_market_price"],
+        "post_market_price": price_data["post_market_price"],
+        "price_change": price_data["price_change"],
+        "price_change_percent": price_data["price_change_percent"],
+        "previous_close": price_data["previous_close"],
         "open": _safe_get(info, "open") or _safe_get(info, "regularMarketOpen"),
         "day_high": _safe_get(info, "dayHigh") or _safe_get(info, "regularMarketDayHigh"),
         "day_low": _safe_get(info, "dayLow") or _safe_get(info, "regularMarketDayLow"),
@@ -274,10 +577,15 @@ def _ticker_to_dict(ticker: yf.Ticker) -> Dict[str, Any]:
         "52_week_low": _safe_get(info, "fiftyTwoWeekLow"),
         "pe_ratio": _safe_get(info, "trailingPE"),
         "forward_pe": _safe_get(info, "forwardPE"),
+        "peg_ratio": _safe_get(info, "pegRatio"),
+        "price_to_book": _safe_get(info, "priceToBook"),
         "eps": _safe_get(info, "trailingEps"),
         "dividend_yield": _safe_get(info, "dividendYield"),
         "dividend_rate": _safe_get(info, "dividendRate"),
+        "profit_margin": _safe_get(info, "profitMargins"),
+        "revenue_growth": _safe_get(info, "revenueGrowth"),
         "beta": _safe_get(info, "beta"),
+        "52_week_change": _safe_get(info, "52WeekChange"),
         "sector": _safe_get(info, "sector"),
         "industry": _safe_get(info, "industry"),
         "description": _safe_get(info, "longBusinessSummary"),
@@ -290,25 +598,41 @@ def _ticker_to_dict(ticker: yf.Ticker) -> Dict[str, Any]:
 def _format_quote_markdown(data: Dict[str, Any]) -> str:
     """Format quote data as markdown."""
     price = data.get("current_price", "N/A")
-    prev_close = data.get("previous_close")
-    
+    price_change = data.get("price_change")
+    pct_change = data.get("price_change_percent")
+    price_label = data.get("current_price_label") or "Price"
+    volume = data.get("volume")
+    volume_display = f"{volume:,}" if isinstance(volume, (int, float)) else "N/A"
+    regular_market_price = data.get("regular_market_price")
+    regular_market_display = (
+        f"${regular_market_price}" if isinstance(regular_market_price, (int, float)) else "N/A"
+    )
+
     change = ""
-    if price != "N/A" and prev_close:
-        price_change = price - prev_close
-        pct_change = (price_change / prev_close) * 100
+    if isinstance(price, (int, float)) and isinstance(price_change, (int, float)) and isinstance(
+        pct_change, (int, float)
+    ):
         direction = "🟢" if price_change >= 0 else "🔴"
         change = f" {direction} {price_change:+.2f} ({pct_change:+.2f}%)"
-    
+
+    session_line = ""
+    if data.get("current_price_source") != "regular_market":
+        session_line = (
+            f"\n**Session:** {price_label}"
+            f" | Regular Market: {regular_market_display}"
+        )
+
     return f"""## {data.get('name', 'Unknown')} ({data.get('symbol', 'N/A')})
 
-**Price:** ${price}{change}
+**{price_label}:** ${price}{change}{session_line}
 
 | Metric | Value |
 |--------|-------|
 | Open | ${data.get('open', 'N/A')} |
 | Day High | ${data.get('day_high', 'N/A')} |
 | Day Low | ${data.get('day_low', 'N/A')} |
-| Volume | {data.get('volume', 'N/A'):,} |
+| Previous Close | ${data.get('previous_close', 'N/A')} |
+| Volume | {volume_display} |
 | Market Cap | {_format_number(data.get('market_cap'))} |
 | P/E Ratio | {data.get('pe_ratio', 'N/A')} |
 | 52W High | ${data.get('52_week_high', 'N/A')} |
@@ -331,7 +655,8 @@ def _format_quote_markdown(data: Dict[str, Any]) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_quote(params: TickerInput) -> str:
+@with_timeout()
+def yf_get_quote(params: TickerInput) -> str:
     """Get real-time stock quote and basic information for a ticker.
     
     Retrieves current price, daily statistics, and key metrics for a stock.
@@ -345,8 +670,7 @@ async def yf_get_quote(params: TickerInput) -> str:
         str: Quote data in requested format (JSON or Markdown)
     """
     try:
-        ticker = yf.Ticker(params.symbol)
-        data = _ticker_to_dict(ticker)
+        data = _get_ticker_data(params.symbol)
         
         if not data.get("name") and not data.get("current_price"):
             return f"Error: No data found for symbol '{params.symbol}'. Please verify the ticker is correct."
@@ -368,7 +692,8 @@ async def yf_get_quote(params: TickerInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_multiple_quotes(params: MultiTickerInput) -> str:
+@with_timeout()
+def yf_get_multiple_quotes(params: MultiTickerInput) -> str:
     """Get real-time quotes for multiple stocks at once.
     
     Efficiently retrieves current prices and key metrics for up to 10 stocks.
@@ -382,13 +707,7 @@ async def yf_get_multiple_quotes(params: MultiTickerInput) -> str:
         str: Quotes data for all requested symbols
     """
     try:
-        results = {}
-        for symbol in params.symbols:
-            try:
-                ticker = yf.Ticker(symbol)
-                results[symbol] = _ticker_to_dict(ticker)
-            except Exception as e:
-                results[symbol] = {"error": str(e)}
+        results = _get_multiple_ticker_data(params.symbols)
         
         if params.response_format == ResponseFormat.MARKDOWN:
             md_output = "# Stock Quotes\n\n"
@@ -414,7 +733,8 @@ async def yf_get_multiple_quotes(params: MultiTickerInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_historical_data(params: HistoricalDataInput) -> str:
+@with_timeout()
+def yf_get_historical_data(params: HistoricalDataInput) -> str:
     """Get historical OHLCV (Open, High, Low, Close, Volume) data for a stock.
     
     Retrieves historical price data with customizable period and interval.
@@ -487,7 +807,8 @@ async def yf_get_historical_data(params: HistoricalDataInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_financials(params: TickerInput) -> str:
+@with_timeout()
+def yf_get_financials(params: TickerInput) -> str:
     """Get financial statements for a company.
     
     Retrieves income statement, balance sheet, and cash flow data.
@@ -569,10 +890,11 @@ async def yf_get_financials(params: TickerInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_options(params: OptionsInput) -> str:
+@with_timeout()
+def yf_get_options(params: OptionsInput) -> str:
     """Get options chain data for a stock.
     
-    Retrieves calls and puts with strike prices, premiums, and Greeks.
+    Retrieves calls and puts with strike prices, premiums, IV, OI, and volume.
     
     Args:
         params (OptionsInput): Input containing:
@@ -657,7 +979,8 @@ async def yf_get_options(params: OptionsInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_dividends(params: TickerInput) -> str:
+@with_timeout()
+def yf_get_dividends(params: TickerInput) -> str:
     """Get dividend history and information for a stock.
     
     Retrieves historical dividend payments and current yield information.
@@ -726,7 +1049,8 @@ async def yf_get_dividends(params: TickerInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_recommendations(params: TickerInput) -> str:
+@with_timeout()
+def yf_get_recommendations(params: TickerInput) -> str:
     """Get analyst recommendations and price targets for a stock.
     
     Retrieves buy/sell/hold ratings and target price information.
@@ -743,6 +1067,7 @@ async def yf_get_recommendations(params: TickerInput) -> str:
         ticker = yf.Ticker(params.symbol)
         info = ticker.info
         recommendations = ticker.recommendations
+        price_data = _resolve_quote_price(info)
         
         rec_records = []
         if recommendations is not None and not recommendations.empty:
@@ -764,7 +1089,11 @@ async def yf_get_recommendations(params: TickerInput) -> str:
             "target_low": _safe_get(info, "targetLowPrice"),
             "target_mean": _safe_get(info, "targetMeanPrice"),
             "target_median": _safe_get(info, "targetMedianPrice"),
-            "current_price": _safe_get(info, "currentPrice"),
+            "current_price": price_data["current_price"],
+            "current_price_source": price_data["current_price_source"],
+            "regular_market_price": price_data["regular_market_price"],
+            "post_market_price": price_data["post_market_price"],
+            "pre_market_price": price_data["pre_market_price"],
             "recent_recommendations": rec_records
         }
         
@@ -809,7 +1138,8 @@ async def yf_get_recommendations(params: TickerInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_news(params: TickerInput) -> str:
+@with_timeout()
+def yf_get_news(params: TickerInput) -> str:
     """Get recent news articles related to a stock.
     
     Retrieves latest news headlines and summaries.
@@ -831,13 +1161,73 @@ async def yf_get_news(params: TickerInput) -> str:
         
         news_records = []
         for item in news[:15]:
+            # yfinance has changed the news payload structure over time.
+            # Support both legacy top-level keys and the nested `content` schema.
+            item = item if isinstance(item, dict) else {}
+            content_raw = item.get("content")
+            content = content_raw if isinstance(content_raw, dict) else {}
+
+            provider_raw = content.get("provider")
+            provider = provider_raw if isinstance(provider_raw, dict) else {}
+
+            click_raw = content.get("clickThroughUrl")
+            click = click_raw if isinstance(click_raw, dict) else {}
+
+            canonical_raw = content.get("canonicalUrl")
+            canonical = canonical_raw if isinstance(canonical_raw, dict) else {}
+
+            title = (
+                item.get("title")
+                or content.get("title")
+                or content.get("headline")
+                or ""
+            )
+            publisher = (
+                item.get("publisher")
+                or item.get("provider")
+                or provider.get("displayName")
+                or provider.get("name")
+                or ""
+            )
+            link = (
+                item.get("link")
+                or click.get("url")
+                or canonical.get("url")
+                or content.get("url")
+                or ""
+            )
+
+            publish_raw = (
+                item.get("providerPublishTime")
+                or content.get("pubDate")
+                or content.get("publishedAt")
+            )
+            published = None
+            if isinstance(publish_raw, (int, float)):
+                ts = float(publish_raw)
+                # Some payloads come in milliseconds.
+                if ts > 1e12:
+                    ts /= 1000.0
+                if ts > 0:
+                    published = datetime.fromtimestamp(ts).isoformat()
+            elif isinstance(publish_raw, str) and publish_raw.strip():
+                published = publish_raw
+
+            thumb_raw = item.get("thumbnail") or content.get("thumbnail") or {}
+            thumb = thumb_raw if isinstance(thumb_raw, dict) else {}
+            thumbnail = None
+            resolutions = thumb.get("resolutions") if isinstance(thumb, dict) else []
+            if isinstance(resolutions, list) and resolutions:
+                first_res = resolutions[0] if isinstance(resolutions[0], dict) else {}
+                thumbnail = first_res.get("url") if isinstance(first_res, dict) else None
+
             news_records.append({
-                "title": item.get("title", ""),
-                "publisher": item.get("publisher", ""),
-                "link": item.get("link", ""),
-                "published": datetime.fromtimestamp(item.get("providerPublishTime", 0)).isoformat() if item.get("providerPublishTime") else None,
-                "type": item.get("type", ""),
-                "thumbnail": item.get("thumbnail", {}).get("resolutions", [{}])[0].get("url") if item.get("thumbnail") else None
+                "title": title,
+                "publisher": publisher,
+                "link": link,
+                "published": published,
+                "type": item.get("type") or content.get("contentType") or "",
+                "thumbnail": thumbnail
             })
         
         result = {
@@ -869,7 +1259,8 @@ async def yf_get_news(params: TickerInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_holders(params: TickerInput) -> str:
+@with_timeout()
+def yf_get_holders(params: TickerInput) -> str:
     """Get major institutional and mutual fund holders for a stock.
     
     Retrieves ownership breakdown and top institutional holders.
@@ -939,7 +1330,8 @@ async def yf_get_holders(params: TickerInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_get_earnings(params: TickerInput) -> str:
+@with_timeout()
+def yf_get_earnings(params: TickerInput) -> str:
     """Get earnings history and upcoming earnings dates.
     
     Retrieves EPS history, revenue, and earnings calendar.
@@ -995,6 +1387,268 @@ async def yf_get_earnings(params: TickerInput) -> str:
         return _handle_error(e, f"Symbol: {params.symbol}")
 
 @mcp.tool(
+    name="yf_get_calendar",
+    annotations={
+        "title": "Get Earnings Calendar",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+@with_timeout()
+def yf_get_calendar(params: TickerInput) -> str:
+    """Get upcoming earnings calendar information for a stock.
+    
+    Retrieves the Yahoo Finance calendar and (if available) detailed earnings dates.
+    
+    Args:
+        params (TickerInput): Input containing:
+            - symbol (str): Stock ticker symbol
+            - response_format (ResponseFormat): Output format preference
+    
+    Returns:
+        str: Calendar data in requested format
+    """
+    try:
+        ticker = yf.Ticker(params.symbol)
+        calendar = _calendar_to_dict(ticker.calendar)
+
+        earnings_dates_records: List[Dict[str, Any]] = []
+        if hasattr(ticker, "get_earnings_dates"):
+            try:
+                earnings_dates_records = _df_to_records(ticker.get_earnings_dates(limit=12))
+            except Exception:
+                earnings_dates_records = []
+
+        result = {
+            "symbol": params.symbol,
+            "calendar": calendar,
+            "earnings_dates": earnings_dates_records
+        }
+
+        if params.response_format == ResponseFormat.MARKDOWN:
+            md = f"## Earnings Calendar: {params.symbol}\n\n"
+
+            next_date = None
+            if isinstance(calendar, dict):
+                for key in calendar.keys():
+                    if "earnings date" in str(key).lower():
+                        next_date = calendar.get(key)
+                        break
+
+            if not next_date and earnings_dates_records:
+                first = earnings_dates_records[0]
+                for key in ("Earnings Date", "Date", "index"):
+                    if key in first:
+                        next_date = first[key]
+                        break
+
+            if next_date:
+                if isinstance(next_date, list) and len(next_date) == 2:
+                    md += f"**Next Earnings Window:** {next_date[0]} to {next_date[1]}\n\n"
+                else:
+                    md += f"**Next Earnings Date:** {next_date}\n\n"
+            else:
+                md += "*No upcoming earnings date found.*\n\n"
+
+            if calendar:
+                md += "### Calendar Fields\n\n"
+                md += "| Field | Value |\n"
+                md += "|-------|-------|\n"
+                for key, value in calendar.items():
+                    md += f"| {key} | {_format_value_for_table(value)} |\n"
+                md += "\n"
+
+            if earnings_dates_records:
+                md += "### Earnings Dates (Recent/Upcoming)\n\n"
+                sample = earnings_dates_records[:6]
+                keys = list(sample[0].keys())
+                date_key = next((k for k in ("Earnings Date", "Date", "index") if k in keys), None)
+                data_keys = [k for k in keys if k != date_key][:3]
+                md += "| Date | " + " | ".join(data_keys) + " |\n"
+                md += "|------|" + "|".join(["------"] * len(data_keys)) + "|\n"
+                for row in sample:
+                    date_val = row.get(date_key, "N/A") if date_key else "N/A"
+                    md += f"| {date_val} | " + " | ".join(_format_value_for_table(row.get(k)) for k in data_keys) + " |\n"
+            return md
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        return _handle_error(e, f"Symbol: {params.symbol}")
+
+@mcp.tool(
+    name="yf_get_sector",
+    annotations={
+        "title": "Get Sector Data",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+@with_timeout()
+def yf_get_sector(params: SectorKeyInput) -> str:
+    """Get sector data and related aggregates from Yahoo Finance.
+
+    Retrieves sector overview, industries, and top companies/ETFs/funds.
+
+    Args:
+        params (SectorKeyInput): Input containing:
+            - key (str): Sector key (e.g., 'technology')
+            - response_format (ResponseFormat): Output format preference
+
+    Returns:
+        str: Sector data in requested format
+    """
+    try:
+        sector = yf.Sector(params.key)
+
+        result = {
+            "key": getattr(sector, "key", params.key),
+            "name": getattr(sector, "name", None),
+            "symbol": getattr(sector, "symbol", None),
+            "overview": _normalize_value(getattr(sector, "overview", None)),
+            "industries": _normalize_value(getattr(sector, "industries", None)),
+            "top_companies": _df_to_records(getattr(sector, "top_companies", None)),
+            "research_reports": _df_to_records(getattr(sector, "research_reports", None)),
+            "top_etfs": _df_to_records(getattr(sector, "top_etfs", None)),
+            "top_mutual_funds": _df_to_records(getattr(sector, "top_mutual_funds", None)),
+        }
+
+        if params.response_format == ResponseFormat.MARKDOWN:
+            md = f"## Sector: {result.get('name') or result.get('key')}\n\n"
+            md += f"**Key:** {result.get('key')}\n"
+            if result.get("symbol"):
+                md += f"**Symbol:** {result.get('symbol')}\n"
+
+            if result.get("overview"):
+                md += "\n### Overview\n\n"
+                overview = result["overview"]
+                if isinstance(overview, dict):
+                    for k, v in list(overview.items())[:8]:
+                        md += f"- **{k}:** {_format_value_for_table(v)}\n"
+                else:
+                    md += f"{overview}\n"
+
+            industries_val = result.get("industries")
+            if industries_val:
+                md += "\n### Industries\n\n"
+                if (
+                    isinstance(industries_val, list)
+                    and industries_val
+                    and isinstance(industries_val[0], dict)
+                ):
+                    md += _records_to_markdown_table(industries_val) + "\n"
+                else:
+                    if isinstance(industries_val, dict):
+                        industries_list = list(industries_val.keys())
+                    elif isinstance(industries_val, list):
+                        industries_list = industries_val
+                    else:
+                        industries_list = [industries_val]
+                    md += ", ".join(str(i) for i in industries_list[:20])
+                    if len(industries_list) > 20:
+                        md += " ..."
+                    md += "\n"
+
+            sections = [
+                ("Top Companies", "top_companies"),
+                ("Top ETFs", "top_etfs"),
+                ("Top Mutual Funds", "top_mutual_funds"),
+                ("Research Reports", "research_reports"),
+            ]
+            for title, key in sections:
+                records = result.get(key) or []
+                if records:
+                    md += f"\n### {title}\n\n"
+                    md += _records_to_markdown_table(records) + "\n"
+
+            return md
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        return _handle_error(e, f"Sector key: {params.key}")
+
+@mcp.tool(
+    name="yf_get_industry",
+    annotations={
+        "title": "Get Industry Data",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+@with_timeout()
+def yf_get_industry(params: IndustryKeyInput) -> str:
+    """Get industry data and related aggregates from Yahoo Finance.
+
+    Retrieves industry overview and top companies.
+
+    Args:
+        params (IndustryKeyInput): Input containing:
+            - key (str): Industry key (e.g., 'software-infrastructure')
+            - response_format (ResponseFormat): Output format preference
+
+    Returns:
+        str: Industry data in requested format
+    """
+    try:
+        industry = yf.Industry(params.key)
+
+        result = {
+            "key": getattr(industry, "key", params.key),
+            "name": getattr(industry, "name", None),
+            "sector_key": getattr(industry, "sector_key", None),
+            "sector_name": getattr(industry, "sector_name", None),
+            "overview": _normalize_value(getattr(industry, "overview", None)),
+            "top_companies": _df_to_records(getattr(industry, "top_companies", None)),
+            "top_performing_companies": _df_to_records(
+                getattr(industry, "top_performing_companies", None)
+            ),
+            "top_growth_companies": _df_to_records(getattr(industry, "top_growth_companies", None)),
+        }
+
+        if params.response_format == ResponseFormat.MARKDOWN:
+            md = f"## Industry: {result.get('name') or result.get('key')}\n\n"
+            md += f"**Key:** {result.get('key')}\n"
+            if result.get("sector_name") or result.get("sector_key"):
+                md += f"**Sector:** {result.get('sector_name') or 'N/A'}"
+                if result.get("sector_key"):
+                    md += f" ({result.get('sector_key')})"
+                md += "\n"
+
+            if result.get("overview"):
+                md += "\n### Overview\n\n"
+                overview = result["overview"]
+                if isinstance(overview, dict):
+                    for k, v in list(overview.items())[:8]:
+                        md += f"- **{k}:** {_format_value_for_table(v)}\n"
+                else:
+                    md += f"{overview}\n"
+
+            sections = [
+                ("Top Companies", "top_companies"),
+                ("Top Performing Companies", "top_performing_companies"),
+                ("Top Growth Companies", "top_growth_companies"),
+            ]
+            for title, key in sections:
+                records = result.get(key) or []
+                if records:
+                    md += f"\n### {title}\n\n"
+                    md += _records_to_markdown_table(records) + "\n"
+
+            return md
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        return _handle_error(e, f"Industry key: {params.key}")
+
+@mcp.tool(
     name="yf_compare_stocks",
     annotations={
         "title": "Compare Multiple Stocks",
@@ -1004,7 +1658,8 @@ async def yf_get_earnings(params: TickerInput) -> str:
         "openWorldHint": True
     }
 )
-async def yf_compare_stocks(params: MultiTickerInput) -> str:
+@with_timeout()
+def yf_compare_stocks(params: MultiTickerInput) -> str:
     """Compare key metrics across multiple stocks.
     
     Creates a side-by-side comparison of fundamental metrics.
@@ -1019,28 +1674,25 @@ async def yf_compare_stocks(params: MultiTickerInput) -> str:
     """
     try:
         comparison = []
-        
-        for symbol in params.symbols:
-            try:
-                ticker = yf.Ticker(symbol)
-                info = ticker.info
-                comparison.append({
-                    "symbol": symbol,
-                    "name": _safe_get(info, "shortName"),
-                    "price": _safe_get(info, "currentPrice") or _safe_get(info, "regularMarketPrice"),
-                    "market_cap": _safe_get(info, "marketCap"),
-                    "pe_ratio": _safe_get(info, "trailingPE"),
-                    "forward_pe": _safe_get(info, "forwardPE"),
-                    "peg_ratio": _safe_get(info, "pegRatio"),
-                    "price_to_book": _safe_get(info, "priceToBook"),
-                    "dividend_yield": _safe_get(info, "dividendYield"),
-                    "profit_margin": _safe_get(info, "profitMargins"),
-                    "revenue_growth": _safe_get(info, "revenueGrowth"),
-                    "beta": _safe_get(info, "beta"),
-                    "52_week_change": _safe_get(info, "52WeekChange")
-                })
-            except Exception as e:
-                comparison.append({"symbol": symbol, "error": str(e)})
+        for symbol, data in _get_multiple_ticker_data(params.symbols).items():
+            if "error" in data:
+                comparison.append({"symbol": symbol, "error": data["error"]})
+                continue
+            comparison.append({
+                "symbol": symbol,
+                "name": data.get("name"),
+                "price": data.get("current_price"),
+                "market_cap": data.get("market_cap"),
+                "pe_ratio": data.get("pe_ratio"),
+                "forward_pe": data.get("forward_pe"),
+                "peg_ratio": data.get("peg_ratio"),
+                "price_to_book": data.get("price_to_book"),
+                "dividend_yield": data.get("dividend_yield"),
+                "profit_margin": data.get("profit_margin"),
+                "revenue_growth": data.get("revenue_growth"),
+                "beta": data.get("beta"),
+                "52_week_change": data.get("52_week_change"),
+            })
         
         if params.response_format == ResponseFormat.MARKDOWN:
             md = "## Stock Comparison\n\n"
